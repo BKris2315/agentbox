@@ -1,4 +1,4 @@
-# agentbox v3: a minimal default-deny sandbox for AI coding agents
+# agentbox: a minimal default-deny sandbox for AI coding agents
 
 This is one Bash script, `agentbox`. It needs no daemon, no VM, no container image, no Node and no Podman.
 
