@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# agentbox: default-deny filesystem sandbox for AI coding agents, VS Code and
+# Remote-SSH sessions. Needs only bash + coreutils + one backend:
+#   bwrap   (preferred: mount/pid/ipc namespaces; real paths are invisible)
+#   landlock via python3 (fallback when user namespaces are blocked; weaker)
+# Never falls back to running unsandboxed.
+set -euo pipefail
+umask 077
+
+die() { echo "agentbox: FAIL CLOSED: $*" >&2; exit 1; }
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  agentbox [--ro PATH]... [--rw PATH]... PROJECT [-- CMD [ARGS...]]
+                         run CMD (default: $SHELL) with PROJECT read-write
+  agentbox setup         download the shared VS Code (tarball, no sudo) once
+  agentbox ext CODE_CLI_ARGS...
+                         manage the shared extensions, e.g.
+                         ext --install-extension anthropic.claude-code
+                         ext --update-extensions | ext --list-extensions
+  agentbox code [--ro PATH]... [--rw PATH]... PROJECT
+                         run the shared VS Code + extensions (read-only) sandboxed
+  agentbox gate PROJECT [--ro PATH]...
+                         SSH forced command; see README (remote side)
+  agentbox check [PROJECT]
+                         prove the sandbox hides $HOME, ~/.ssh and env secrets
+Env: AGENTBOX_BACKEND=auto|bwrap|landlock  AGENTBOX_PROFILE=name (shared agent home)
+EOF
+  exit 2
+}
+
+REAL_HOME=$HOME
+STATE=$HOME/.local/share/agentbox   # not XDG_DATA_HOME: snaps repoint it per revision
+VSCODE=$STATE/vscode                # one VS Code for all sandboxes
+EXTS=$STATE/extensions              # one extension set for all sandboxes
+
+RO=() RW=()
+parse_grants() {  # sets RO, RW, PROJECT, CMD
+  PROJECT='' CMD=()
+  while (($#)); do
+    case $1 in
+      --ro) RO+=("$(realpath -e -- "$2")") || die "no such path: $2"; shift 2 ;;
+      --rw) RW+=("$(realpath -e -- "$2")") || die "no such path: $2"; shift 2 ;;
+      --) shift; CMD=("$@"); break ;;
+      -*) usage ;;
+      *) [[ -z $PROJECT ]] || usage; PROJECT=$(realpath -e -- "$1") || die "no such dir: $1"; shift ;;
+    esac
+  done
+  [[ -n $PROJECT && -d $PROJECT ]] || usage
+  # Granting $HOME (or /) would grant everything we try to hide.
+  local p
+  for p in "$PROJECT" "${RW[@]}" "${RO[@]}"; do
+    [[ $p != / && $p != "$REAL_HOME" && $p != "$STATE"* ]] || die "refusing to grant $p"
+    [[ $REAL_HOME != "$p"/* ]] || die "refusing to grant $p (contains your home)"
+  done
+}
+
+# Per-project agent home: agent logins, ~/.vscode-server, caches live here.
+# Separate projects cannot read or poison each other's agent home.
+agent_home() {
+  local name=${AGENTBOX_PROFILE:-$(basename "$PROJECT")-$(printf %s "$PROJECT" | sha256sum | cut -c1-8)}
+  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "bad profile name: $name"
+  AHOME=$STATE/$name/home
+  mkdir -p "$AHOME/.local/bin" "$AHOME/tmp"
+}
+
+# Environment is rebuilt from a whitelist: tokens in env (AWS_*, GH_TOKEN,
+# SSH_AUTH_SOCK, DBUS_SESSION_BUS_ADDRESS, ...) never reach the sandbox.
+base_env() {
+  ENV=(env -i HOME="$REAL_HOME" USER="${USER:-$(id -un)}" LOGNAME="${USER:-$(id -un)}"
+       SHELL=/bin/bash TERM="${TERM:-dumb}" LANG="${LANG:-C.UTF-8}" TMPDIR="$REAL_HOME/tmp"
+       PATH="$REAL_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+       AGENTBOX=1)
+  [[ -z ${COLORTERM:-} ]] || ENV+=(COLORTERM="$COLORTERM")
+  [[ -z ${TZ:-} ]] || ENV+=(TZ="$TZ")
+}
+
+have_bwrap() { command -v bwrap >/dev/null && bwrap --ro-bind / / --unshare-user --unshare-pid true 2>/dev/null; }
+have_landlock() {
+  command -v python3 >/dev/null &&
+    python3 -I -c 'import ctypes,sys;sys.exit(ctypes.CDLL(None).syscall(444,None,0,1)<1)' 2>/dev/null
+}
+pick_backend() {
+  case ${AGENTBOX_BACKEND:-auto} in
+    bwrap) have_bwrap || die 'bwrap unusable (missing or user namespaces blocked)'; BACKEND=bwrap ;;
+    landlock) have_landlock || die 'landlock unavailable (needs python3 + kernel >= 5.13)'; BACKEND=landlock ;;
+    auto) if have_bwrap; then BACKEND=bwrap
+          elif have_landlock; then BACKEND=landlock
+            echo 'agentbox: WARNING: bwrap unusable, using weaker landlock backend' >&2
+          else die 'neither bwrap nor landlock is usable; ask an admin (see README)'; fi ;;
+    *) die "unknown AGENTBOX_BACKEND" ;;
+  esac
+}
+
+# exec_sandboxed EXTRA_BWRAP_ARGS_ARRAY_NAME CMD...
+exec_sandboxed() {
+  local -n extra=$1; shift
+  local p
+  if [[ $BACKEND == bwrap ]]; then
+    local a=(--die-with-parent --unshare-all --share-net --hostname agentbox
+             --ro-bind /usr /usr --ro-bind /etc /etc --proc /proc --dev /dev
+             --ro-bind-try /run/systemd/resolve /run/systemd/resolve
+             --tmpfs /tmp --tmpfs "$REAL_HOME" --bind "$AHOME" "$REAL_HOME")
+    for p in /bin /sbin /lib /lib32 /lib64 /libx32; do
+      if [[ -L $p ]]; then a+=(--symlink "$(readlink "$p")" "$p")
+      elif [[ -d $p ]]; then a+=(--ro-bind "$p" "$p"); fi
+    done
+    # TIOCSTI keystroke injection into the caller's terminal is only possible
+    # where the kernel still allows it; detach from the tty in that case.
+    [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null) == 0 ]] || a+=(--new-session)
+    for p in "${RO[@]}"; do a+=(--ro-bind "$p" "$p"); done
+    for p in "${RW[@]}" "$PROJECT"; do a+=(--bind "$p" "$p"); done
+    exec "${ENV[@]}" bwrap "${a[@]}" "${extra[@]}" --chdir "$PROJECT" -- "$@"
+  else
+    # Landlock: paths stay visible but every access outside the grants is denied.
+    local a=(--ro /usr --ro /etc --ro /proc --ro /sys --dev /dev)
+    for p in /bin /sbin /lib /lib32 /lib64 /libx32 /run/systemd/resolve; do [[ -e $p ]] && a+=(--ro "$p"); done
+    for p in "${RO[@]}"; do a+=(--ro "$p"); done
+    for p in "${RW[@]}" "$PROJECT"; do a+=(--rw "$p"); done
+    cd "$PROJECT"
+    exec "${ENV[@]}" HOME="$AHOME" TMPDIR="$AHOME/tmp" PATH="$AHOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+      python3 -I -c "$LANDLOCK_PY" "${a[@]}" --rw "$AHOME" -- "$@"
+  fi
+}
+
+LANDLOCK_PY='
+import ctypes, os, struct, sys
+libc = ctypes.CDLL(None, use_errno=True)
+sc = libc.syscall; sc.restype = ctypes.c_long
+abi = sc(444, None, 0, 1)
+if abi < 1: sys.exit("agentbox: FAIL CLOSED: landlock unavailable")
+FILE_BITS = 1 | 2 | 4 | (1 << 14 if abi >= 3 else 0)         # exec, write, read, truncate
+RO = 1 | 4 | 8                                               # exec, read file, read dir
+ALL = (1 << 13) - 1 | (1 << 13 if abi >= 2 else 0) | (1 << 14 if abi >= 3 else 0) | (1 << 15 if abi >= 5 else 0)
+DEV = RO | 2 | (1 << 15 if abi >= 5 else 0)                  # /dev/null, /dev/tty
+scoped = 3 if abi >= 6 else 0                                # abstract unix sockets + signals
+attr = struct.pack("QQQ", ALL, 0, scoped) if abi >= 6 else struct.pack("Q", ALL)
+fd = sc(444, attr, len(attr), 0)
+if fd < 0: sys.exit("agentbox: FAIL CLOSED: landlock_create_ruleset failed")
+args = sys.argv[1:]; i = args.index("--"); rules, cmd = args[:i], args[i + 1:]
+for kind, path in zip(rules[::2], rules[1::2]):
+    acc = {"--ro": RO, "--rw": ALL, "--dev": DEV}[kind]
+    pfd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+    if not os.path.isdir(path): acc &= FILE_BITS
+    if sc(445, fd, 1, struct.pack("=Qi", acc, pfd), 0) != 0:
+        sys.exit("agentbox: FAIL CLOSED: landlock_add_rule " + path)
+    os.close(pfd)
+if libc.prctl(38, 1, 0, 0, 0) != 0 or sc(446, fd, 0) != 0:
+    sys.exit("agentbox: FAIL CLOSED: landlock_restrict_self failed")
+os.execvp(cmd[0], cmd)
+'
+
+cmd_run() {
+  parse_grants "$@"; agent_home; base_env; pick_backend
+  ((${#CMD[@]})) || CMD=(/bin/bash -l)
+  local none=()
+  exec_sandboxed none "${CMD[@]}"
+}
+
+# VS Code and extensions are shared by every sandbox but mounted read-only at
+# fixed paths, so an agent can neither tamper with them nor see other profiles.
+VS_IN=/opt/vscode EXT_IN=/opt/vscode-extensions
+vscode_mounts() {  # $1 = ro|rw for the extensions dir; sets X and BIN
+  local src
+  if [[ -x $VSCODE/bin/code ]]; then src=$VSCODE
+  else
+    src=$(realpath -e "$(command -v code 2>/dev/null)" 2>/dev/null) || src=''
+    [[ $src == /usr/* ]] || die "no usable VS Code (snap cannot be sandboxed); run: agentbox setup"
+    src=${src%/bin/*}
+  fi
+  mkdir -p "$EXTS"
+  X=(--ro-bind "$src" "$VS_IN")
+  if [[ $1 == rw ]]; then X+=(--bind "$EXTS" "$EXT_IN"); else X+=(--ro-bind "$EXTS" "$EXT_IN"); fi
+  BIN=$VS_IN/bin/code
+}
+
+cmd_setup() {
+  [[ ! -e $VSCODE ]] || { echo "already installed: $VSCODE (delete it to reinstall/upgrade)"; return; }
+  local arch; case $(uname -m) in x86_64) arch=x64 ;; aarch64) arch=arm64 ;; *) die "unsupported arch" ;; esac
+  local tmp; tmp=$(mktemp -d "$STATE.dl.XXXXXX")
+  echo "downloading VS Code ($arch) to $VSCODE ..."
+  curl -fsSL "https://update.code.visualstudio.com/latest/linux-$arch/stable" | tar -xz -C "$tmp" || { rm -rf "$tmp"; die 'download failed'; }
+  mkdir -p "$STATE"; mv "$tmp"/VSCode-linux-* "$VSCODE"; rmdir "$tmp"
+  echo "installed: $("$VSCODE/bin/code" --version | head -1). Next: agentbox ext --install-extension anthropic.claude-code"
+}
+
+# Extension admin sandbox: sees no project, only the shared extensions dir (rw).
+cmd_ext() {
+  (($#)) || usage
+  PROJECT=$STATE/ext-admin; mkdir -p "$PROJECT"
+  AGENTBOX_PROFILE=ext-admin; agent_home; base_env; pick_backend
+  [[ $BACKEND == bwrap ]] || die 'ext requires the bwrap backend'
+  vscode_mounts rw
+  exec_sandboxed X "$BIN" --extensions-dir "$EXT_IN" "$@"
+}
+
+cmd_code() {
+  parse_grants "$@"; agent_home; base_env; pick_backend
+  [[ $BACKEND == bwrap ]] || die 'VS Code mode requires the bwrap backend'
+  vscode_mounts ro
+  local cfg=$AHOME/.config/Code/User/settings.json
+  [[ -e $cfg ]] || { mkdir -p "${cfg%/*}"; printf '%s\n' '{' '  "update.mode": "none",' \
+    '  "extensions.autoUpdate": false,' '  "extensions.autoCheckUpdates": false' '}' >"$cfg"; }
+  X+=(--ro-bind-try /sys /sys --dev-bind-try /dev/dri /dev/dri)
+  local rt=/run/user/$(id -u)
+  X+=(--dir "$rt" --setenv XDG_RUNTIME_DIR "$rt")
+  # basic password store: no host keyring; read-only extensions: no self-updates.
+  local flags=(--password-store=basic --extensions-dir "$EXT_IN" --wait --new-window)
+  if [[ -n ${WAYLAND_DISPLAY:-} && -S ${XDG_RUNTIME_DIR:-}/$WAYLAND_DISPLAY ]]; then
+    X+=(--ro-bind "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" "$rt/$WAYLAND_DISPLAY" --setenv WAYLAND_DISPLAY "$WAYLAND_DISPLAY")
+    flags+=(--ozone-platform=wayland)
+  elif [[ -n ${DISPLAY:-} ]]; then
+    echo 'agentbox: WARNING: X11 lets sandboxed apps read other windows/keystrokes; prefer Wayland' >&2
+    X+=(--ro-bind /tmp/.X11-unix /tmp/.X11-unix --setenv DISPLAY "$DISPLAY")
+    [[ -z ${XAUTHORITY:-} ]] || X+=(--ro-bind "$XAUTHORITY" "$rt/Xauthority" --setenv XAUTHORITY "$rt/Xauthority")
+  else
+    die 'no Wayland or X11 display'
+  fi
+  exec_sandboxed X "$BIN" "${flags[@]}" "$PROJECT"
+}
+
+# Used from ~/.ssh/authorized_keys on the remote host:
+#   restrict,pty,port-forwarding,permitopen="localhost:*",permitopen="127.0.0.1:*",command="~/.local/bin/agentbox gate /srv/proj" ssh-ed25519 ...
+# Every session with that key (shell, VS Code Server, agents) runs sandboxed.
+cmd_gate() {
+  local project=${1:-}; shift || true
+  parse_grants "$project" "$@"; agent_home; base_env; pick_backend
+  local none=()
+  if [[ -n ${SSH_ORIGINAL_COMMAND:-} ]]; then
+    exec_sandboxed none /bin/bash -c "$SSH_ORIGINAL_COMMAND"
+  else
+    exec_sandboxed none /bin/bash -l
+  fi
+}
+
+cmd_check() {
+  local dir=${1:-$(mktemp -d)}; export AGENTBOX_PROFILE=${AGENTBOX_PROFILE:-agentbox-check}
+  local canary="$REAL_HOME/.agentbox-canary-$$"
+  echo secret >"$canary"; trap "rm -f '$canary'" EXIT
+  export AGENTBOX_TEST_SECRET=leak
+  # shellcheck disable=SC2016
+  if (cmd_run "$dir" -- /bin/bash -c '
+      fail=0; t() { if eval "$2" >/dev/null 2>&1; then echo "FAIL  $1"; fail=1; else echo "ok    $1"; fi; }
+      t "home canary unreadable"        "cat '"$canary"'"
+      t "~/.ssh hidden"                 "ls '"$REAL_HOME"'/.ssh"
+      t "env secret not inherited"      "test -n \"\${AGENTBOX_TEST_SECRET:-}\""
+      t "ssh-agent socket not inherited" "test -n \"\${SSH_AUTH_SOCK:-}\""
+      t "/root unreadable"              "ls /root"
+      t "project writable"             "! touch .agentbox-w"
+      rm -f .agentbox-w; exit $fail'); then
+    echo "PASS: sandbox enforced (backend: $(AGENTBOX_BACKEND=${AGENTBOX_BACKEND:-auto}; pick_backend 2>/dev/null; echo "$BACKEND"))"
+  else
+    die 'sandbox checks failed; do not use'
+  fi
+}
+
+case ${1:-} in
+  setup) cmd_setup ;;
+  ext) shift; cmd_ext "$@" ;;
+  code) shift; cmd_code "$@" ;;
+  gate) shift; cmd_gate "$@" ;;
+  check) shift; cmd_check "$@" ;;
+  ''|-h|--help) usage ;;
+  *) cmd_run "$@" ;;
+esac
