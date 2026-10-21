@@ -1,23 +1,112 @@
 # agentbox: a minimal default-deny sandbox for AI coding agents
 
-This is one Bash script, `agentbox`. It needs no daemon, no VM, no container image, no Node and no Podman.
+This is one Bash script, `agentbox`. It needs no daemon, no VM, no container image, no Node and no Podman, only `/usr/bin/python3` (preinstalled on Ubuntu).
 
 | Backend | Needs | Used when |
 |---|---|---|
 | **bwrap** (preferred) | `bubblewrap`, unprivileged user namespaces | available (default Ubuntu 22.04; 24.04 needs an AppArmor rule, see below) |
-| **landlock** (fallback) | `python3`, kernel ≥ 5.13 | bwrap missing or user namespaces blocked. No root needed. |
+| **landlock** (fallback) | kernel ≥ 5.13 | bwrap missing or user namespaces blocked. No root needed. |
 | neither | n/a | the script **refuses to run**; it never falls back to running unsandboxed |
 
 Inside the sandbox an agent sees:
 
-- the project (read-write)
-- the paths you grant explicitly (`--ro` / `--rw`)
+- the project (read-write, except `.git/config` and `.git/hooks`, see below)
+- the paths you grant explicitly (`--ro` / `--rw`), minus anything you `--mask`
 - a **per-project agent home** (`~/.local/share/agentbox/<project>-<hash>/home`), mounted at `$HOME`
 - read-only `/usr` and `/etc`
 
-Your real `$HOME` (including `~/.ssh`, `~/.aws`, browser profiles and other repos) is either absent (bwrap) or unreadable (landlock). The environment is rebuilt from a whitelist, so `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `AWS_*` and `*_TOKEN` variables are not inherited.
+Your real `$HOME` (including `~/.ssh`, `~/.aws`, browser profiles, other repos and your personal folders) is either absent (bwrap) or unreadable (landlock). The environment is rebuilt from a whitelist, so `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `AWS_*` and `*_TOKEN` variables are not inherited.
 
 Grants are command-line arguments chosen by the human. The agent cannot edit them, because the launcher and its config live outside the sandbox.
+
+## How it is enforced
+
+The sandbox is enforced by the kernel, not by watching commands. A Bash script, a Python script or a compiled binary the agent writes is confined exactly like the agent itself.
+
+### Layers
+
+| Layer | What it stops | Backend |
+|---|---|---|
+| Mount namespace / Landlock filesystem rules | reading or writing anything outside the grants | both |
+| Protected paths | granting home, secrets or personal folders by mistake | both |
+| Read-only `.git/config` and `.git/hooks`, pinned `.git` | planting code that git later runs **on the host** | bwrap |
+| `--mask` | secrets inside a granted tree (`.env`) | bwrap |
+| seccomp filter | kernel keyring, ptrace, new namespaces, io_uring, bpf, mount, TIOCSTI keystroke injection | both |
+| Landlock TCP port rules (`--net web`) | local databases, Docker API, dev servers on non-ephemeral ports | both, kernel ≥ 6.7 |
+| No network + allowlisting proxy (`--net proxy`) | exfiltration to arbitrary hosts, host abstract Unix sockets (X11) | bwrap |
+| Dedicated account (`agentbox adduser`) | same-UID side channels | both, needs sudo |
+| VM | kernel exploits | any |
+
+### Protected paths
+
+Some paths can never be granted: your home itself (or `/`), agentbox's own state, credential stores (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config`, keyrings, `.netrc`, `.git-credentials`, ...) and files your host executes (`~/.bashrc`, `~/.profile`, `~/.local/bin`, `~/bin`). This applies to the path itself, anything inside it, and anything that contains it, so `--rw ~/.local` is refused too.
+
+**Personal folders** (Desktop, Documents, Downloads, Music, Pictures, Videos, Public, Templates, plus any locations set in `~/.config/user-dirs.dirs`) are protected by default. A whole personal folder is never granted. To grant a subfolder, pass `--allow-personal`:
+
+```bash
+agentbox --allow-personal --ro ~/Documents/specs ~/repos/app
+```
+
+### Git: code that runs outside the sandbox
+
+Git runs commands named in `.git/config` (`core.fsmonitor`, `core.sshCommand`, filter drivers, ...) and scripts in `.git/hooks` with **your full rights** whenever you use the repo outside the sandbox. A plain `git status` is enough to trigger some of them. Under bwrap, agentbox therefore:
+
+- mounts `.git/config`, `.git/hooks` and `.git/info` read-only, and does the same for submodules (`.git/modules/*`), for every repo up to 3 levels deep in the project and `--rw` grants
+- bind-mounts `.git` onto itself, so the agent cannot rename it away and plant a fake one
+
+The agent can still commit, branch and rebase. To change the repo config, do it outside the sandbox.
+
+The landlock backend can't make part of a granted tree read-only, so it prints a warning. Either way, use `agentbox git` for git commands outside the sandbox on agent-touched repos:
+
+```bash
+agentbox git -C ~/repos/app push
+```
+
+It refuses to run if the repo config contains anything that runs commands or redirects git (`core.fsmonitor`, `core.sshCommand`, `alias.*`, `url.*`, `include*`, filter or diff drivers, ...), and it never runs hooks.
+
+Other files a host tool may execute: `Makefile`, `package.json` scripts, `.envrc` (direnv) and `.vscode/tasks.json`. Review the diff before running them outside the sandbox, and keep VS Code's Workspace Trust enabled for agent-touched repos.
+
+### Network modes (`--net`)
+
+| Mode | Behaviour | Use for |
+|---|---|---|
+| `auto` (default) | `web` on kernel ≥ 6.7, otherwise `open` with a warning | |
+| `web` | TCP connect only to ports 443, 80, 53, 22, the ephemeral range (`ip_local_port_range`, used by IDE, debugger and forwarded ports) and `--port N[-M]` grants. Fails closed on older kernels. | everyday use |
+| `proxy` | No network except an HTTPS proxy (bwrap only). The proxy runs outside the sandbox and allows only the hosts in `~/.local/share/agentbox/allowlist` plus `--allow-host`. `HTTPS_PROXY` is set inside the sandbox. | untrusted code, sensitive repos |
+| `open` | Same network as the host | Remote-SSH from a sandboxed VS Code, anything `web` breaks |
+
+`web` blocks connections to services on ports such as 5432, 6379, 2375, 3000 and 8080, on any host. If the agent needs to reach its own dev server, add `--port 3000`.
+
+`proxy` notes:
+
+- It writes a default allowlist on first use (Anthropic, OpenAI, GitHub, npm, PyPI, the VS Code marketplace). Edit the file from outside the sandbox; changes apply to new connections immediately.
+- Decisions are logged to `~/.local/share/agentbox/<profile>/proxy.log`. Check it when something doesn't connect.
+- Only HTTPS `CONNECT` is proxied. Plain HTTP, SSH and raw TCP don't work.
+- The sandbox has its own network namespace, so the localhost callback used by some logins can't reach it. Log in once with `--net web` using the same profile.
+
+```bash
+agentbox --net proxy --allow-host gitlab.example.com ~/repos/app -- claude
+```
+
+### Masking secrets in a grant
+
+```bash
+agentbox --mask ~/repos/app/.env --mask ~/repos/app/secrets ~/repos/app -- claude
+```
+
+Inside the sandbox, a masked file appears empty and a masked directory appears empty and read-only (bwrap only).
+
+### seccomp filter
+
+Every sandbox runs under a seccomp filter. It returns `EPERM` for:
+
+- `keyctl`, `add_key`, `request_key` (your kernel keyring)
+- `ptrace` and `process_vm_*`, so `gdb` and `strace` don't work inside
+- creating namespaces (`unshare`, `clone` with namespace flags, `setns`), so tools that sandbox themselves with bwrap don't work inside
+- `io_uring`, `bpf`, `userfaultfd`, `perf_event_open`, mount-related calls, kernel modules, `kexec`
+- the `TIOCSTI` and `TIOCLINUX` ioctls
+
+`agentbox code` uses a variant that still allows namespaces, because VS Code's Chromium sandbox needs them.
 
 ## The four scenarios
 
@@ -88,7 +177,7 @@ Host app-sandbox
   IdentitiesOnly yes
   ForwardAgent no
 EOF
-agentbox code ~/agentbox-remote/app       # then: Remote-SSH -> app-sandbox
+agentbox code ~/agentbox-remote/app       # then: Remote-SSH -> app-sandbox (if it fails to connect: add --net open)
 ```
 
 Even if the laptop-side agent steals `id_agentbox`, the key only opens the sandbox on the remote. Your real SSH key and `ssh-agent` never enter the sandbox. You don't need a tunnel helper.
@@ -121,11 +210,11 @@ Projects that share a profile also share a writable agent home. Something plante
 
 The terminal inside the sandbox can't run `agentbox ext`.
 
-**Signing in (Claude, Codex, GitHub).** Use the extension's login or the Accounts icon in the bottom-left. The sandbox can't open your browser, so copy the login URL into your normal browser. The redirect returns to a localhost server that VS Code starts, and the sandbox shares the network, so this works. Each profile signs in once. (GitHub sign-in is untested.)
+**Signing in (Claude, Codex, GitHub).** Use the extension's login or the Accounts icon in the bottom-left. The sandbox can't open your browser, so copy the login URL into your normal browser. The redirect returns to a localhost server that VS Code starts. That works with `--net web` and `open`, because the sandbox shares the host network, but not with `--net proxy`. Each profile signs in once, so log in with the default mode first. (GitHub sign-in is untested.)
 
 **GitHub and git push.** A normal VS Code GitHub login gives access to *all* your repos, which undoes the separation between projects. Prefer, in this order:
 
-1. **Push from outside the sandbox.** The agent commits, and you run `git push` in a normal terminal. The agent never holds a credential.
+1. **Push from outside the sandbox.** The agent commits, and you run `agentbox git -C ~/repos/app push` in a normal terminal. The agent never holds a credential, and repo config or hooks the agent may have planted never run with your rights (see "Git" above).
 2. **A fine-grained GitHub token for this one repo** (GitHub → Settings → Developer settings → Fine-grained tokens):
 
    ```bash
@@ -162,41 +251,79 @@ To revoke a grant, close the window and relaunch without it.
   ```
 
 - **No bwrap and no sudo:** `apt-get download bubblewrap && dpkg-deb -x bubblewrap_*.deb ~/.local/bwrap`, then add `~/.local/bwrap/usr/bin` to `PATH`. This works only where user namespaces are allowed; otherwise landlock is used.
-- **Dedicated remote account** (recommended on shared servers):
+- **Dedicated account** (recommended on shared servers, useful on laptops too):
 
   ```bash
-  sudo useradd -m agent
-  sudo setfacl -R -m u:agent:rwX /srv/work/app
+  agentbox adduser agent ~/repos/app /srv/work/other   # useradd + ACLs + agentbox check, via sudo
+  sudo -u agent -i agentbox ~/repos/app -- claude       # local use
   ```
 
-  Put the `authorized_keys` line in `~agent/.ssh/`. A separate UID also blocks what namespaces can't: signals and abstract sockets aimed at your own processes, `/tmp` files of your UID, and the kernel keyring.
-- **Highest assurance on the laptop:** run the same `agentbox` inside a VM. This adds protection against kernel exploits. It isn't required for the filesystem boundary.
+  It creates the account and installs agentbox in its `~/.local/bin`. It then grants the account read-write ACLs on each project, adds default ACLs so you and the agent can both use each other's new files, and gives traverse-only (`--x`) access on the parent directories. Finally it runs `agentbox check` as the new user. For remote use, put the `authorized_keys` line in `~agent/.ssh/` with the gate path `~agent/.local/bin/agentbox`.
+
+  A separate UID also blocks what namespaces and seccomp can't: signals and abstract sockets aimed at your own processes, `/tmp` files of your UID, and everything readable only by you.
+
+### Highest assurance: a VM
+
+Every layer above shares the host kernel, so a kernel exploit defeats them all. If that matters, run the same `agentbox` inside a lightweight VM, for example [Multipass](https://multipass.run/) or [Lima](https://lima-vm.io/):
+
+```bash
+multipass launch 24.04 --name agents --cpus 4 --memory 8G --disk 40G
+multipass mount ~/repos/app agents:/home/ubuntu/app      # share only the project
+multipass shell agents                                    # then inside the VM:
+#   install agentbox, run agentbox check, then agentbox ~/app -- claude
+```
+
+Share only project directories into the VM, never your home. Running agentbox inside the VM still matters: it keeps the agent away from the VM's own credentials and from other projects shared into it.
 
 ## Verification
 
-`agentbox check [DIR]` places a canary file in your real home and sets a canary environment variable. It then asserts, from inside the sandbox, that:
+`agentbox check [DIR]` tries to break out the way an agent's script would. It runs as a Python program inside the sandbox, once per network mode (`web`, and `proxy` under bwrap):
 
-- the canary file, `~/.ssh` and `/root` are unreadable
-- the environment and `SSH_AUTH_SOCK` are not inherited
-- the project is writable
+- **Grants (host side):** granting your home, `~/.ssh`, `~/.config`, `~/.local/bin`, `~/.bashrc` or any personal folder is refused.
+- **Files:** a canary in your real home, `~/.ssh`, every personal folder and `/root` are unreadable.
+- **Environment:** a canary variable and `SSH_AUTH_SOCK` are not inherited.
+- **Processes:** the host's `/proc/<pid>/environ` is unreadable.
+- **seccomp:** `keyctl`, `ptrace`, `io_uring`, creating a user namespace and `TIOCSTI` all fail with `EPERM`. The probes are built so the kernel's own errors can't be mistaken for a pass.
+- **Git:** on a fixture repo, `.git/config` and `.git/hooks` can't be written and `.git` can't be renamed, but committing still works.
+- **Mask:** a masked `.env` reads empty.
+- **Network:**
+  - `web`: a listener on a non-allowed local port can't be reached.
+  - `proxy`: direct internet is unreachable, the proxy refuses a host that isn't on the allowlist, and a host abstract Unix socket can't be reached.
+- **Project:** the project is writable.
 
-If any assertion fails, it exits non-zero.
+Lines marked `limit` are documented gaps of the current backend or mode (see "Known limits"). They don't count as failures. Any `FAIL` exits non-zero.
 
-Tested on Ubuntu 22.04, kernel 6.8, bwrap 0.6.1:
+Tested on Ubuntu 22.04, kernel 6.8 (Landlock ABI 4), bwrap 0.6.1:
 
-- `check` passes with **both** backends. The same probes fail when run unsandboxed.
+- `check` passes with **both** backends. Run unsandboxed, the same probes report `FAIL`.
+- With `--net proxy`, `curl https://api.github.com` succeeds through the proxy and `https://example.com` is refused. Both are logged.
+- A `python3` planted in the agent home's `~/.local/bin` is not picked up by the next launch. Earlier versions ran it **outside** the sandbox on the landlock backend.
+- `agentbox git` refuses a repo with `core.fsmonitor` or a filter driver in its config.
+- `ext --list-extensions` works under the seccomp filter, and the `gui` filter variant allows namespaces while still blocking the keyring.
 - Gate end to end through an unprivileged sshd: commands, stdin scripts (the Remote-SSH style), sandboxed `$HOME`, and a forward to `127.0.0.1` all work. Forwarding to `1.1.1.1` is denied by `permitopen`.
 - `setup` installed VS Code 1.141.2, and `ext` installed Claude Code into the shared folder.
 - `agentbox code` started the GUI under Wayland inside the sandbox. VS Code's attempt to auto-update an extension failed against the read-only mount, as intended.
-- **Not tested yet:** using the Claude/Codex extensions interactively, a full VS Code Remote-SSH session through the gate, and Ubuntu 24.04.
+- **Not tested yet:**
+  - launching the VS Code GUI under the seccomp filter and `--net web`
+  - using the Claude/Codex extensions interactively
+  - a full VS Code Remote-SSH session (through the gate, or from a sandboxed laptop VS Code under `--net web`; fall back to `--net open`)
+  - `agentbox adduser`
+  - aarch64
+  - Ubuntu 24.04
 
 ## Known limits (be honest about these)
 
-- **Network is open.** Agents need their API. A sandboxed process can reach anything the host can reach, including localhost services. Egress filtering needs a proxy or firewall, which means root.
+- **Network, except with `--net proxy`.**
+  - `web` restricts ports, not hosts. The agent can send anything it can read to any server on port 443.
+  - `web` also allows the whole ephemeral port range and port 22 on every host, localhost included.
+  - Kernels older than 6.7 get `open`.
+  - Even `proxy` lets the agent send data to the hosts you allowlist, for example a GitHub gist.
 - **Same UID (no-sudo mode).**
-  - The bwrap backend hides other processes (PID namespace), but abstract Unix sockets are shared through the network namespace. This includes X11's `@/tmp/.X11-unix`, so prefer Wayland.
-  - The landlock backend additionally leaves path-based Unix sockets (`/run/user/$UID/bus` and keyring) connectable, and signals are unscoped below kernel 6.12.
-  - Use a dedicated account where you can.
+  - The bwrap backend hides other processes (PID namespace), but abstract Unix sockets are shared through the network namespace, except with `--net proxy`. This includes X11's `@/tmp/.X11-unix`, so prefer Wayland.
+  - The landlock backend additionally leaves path-based Unix sockets (`/run/user/$UID/bus` and keyring) connectable, and signals are unscoped below kernel 6.12 (Landlock ABI 6 scopes both automatically).
+  - Use a dedicated account (`agentbox adduser`) where you can.
+- **Git and other host-executed files on the landlock backend.** `.git/config` and `.git/hooks` stay writable. Use `agentbox git`. On both backends, review `Makefile`, `package.json` scripts, `.envrc` and `.vscode/tasks.json` before running them outside the sandbox.
+- **seccomp trade-offs.** `gdb`, `strace` and tools that build their own namespace sandbox (including nested bwrap) don't work inside. The `gui` variant used by `agentbox code` allows namespaces, which exposes more of the kernel.
 - **Remote-SSH server lifetime.** With `--unshare-pid`, the VS Code Server lives as long as the SSH session that started it, so a reconnect restarts it.
-- **Anything you grant is fully exposed.** That includes secrets inside the project (`.env`) and anything the agent logs into.
+- **Anything you grant is fully exposed.** That includes secrets inside the project that you didn't `--mask`, and anything the agent logs into. `--mask` needs bwrap.
 - **Container- and kernel-escape bugs** are out of scope without a VM.

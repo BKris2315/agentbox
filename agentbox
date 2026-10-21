@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# agentbox: default-deny filesystem sandbox for AI coding agents, VS Code and
-# Remote-SSH sessions. Needs only bash + coreutils + one backend:
+# agentbox: default-deny sandbox for AI coding agents, VS Code and Remote-SSH
+# sessions. Needs bash + coreutils + /usr/bin/python3 + one backend:
 #   bwrap   (preferred: mount/pid/ipc namespaces; real paths are invisible)
-#   landlock via python3 (fallback when user namespaces are blocked; weaker)
+#   landlock (fallback when user namespaces are blocked; weaker)
+# Both add a seccomp filter and, where the kernel allows, Landlock port rules.
 # Never falls back to running unsandboxed.
 set -euo pipefail
 umask 077
@@ -11,19 +12,31 @@ die() { echo "agentbox: FAIL CLOSED: $*" >&2; exit 1; }
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  agentbox [--ro PATH]... [--rw PATH]... PROJECT [-- CMD [ARGS...]]
+  agentbox [OPTIONS] PROJECT [-- CMD [ARGS...]]
                          run CMD (default: $SHELL) with PROJECT read-write
   agentbox setup         download the shared VS Code (tarball, no sudo) once
   agentbox ext CODE_CLI_ARGS...
                          manage the shared extensions, e.g.
                          ext --install-extension anthropic.claude-code
                          ext --update-extensions | ext --list-extensions
-  agentbox code [--ro PATH]... [--rw PATH]... PROJECT
+  agentbox code [OPTIONS] PROJECT
                          run the shared VS Code + extensions (read-only) sandboxed
-  agentbox gate PROJECT [--ro PATH]...
+  agentbox gate PROJECT [OPTIONS]
                          SSH forced command; see README (remote side)
+  agentbox git [-C DIR] GIT_ARGS...
+                         host-side git for agent-touched repos: refuses repo config
+                         that runs commands, never runs hooks
   agentbox check [PROJECT]
-                         prove the sandbox hides $HOME, ~/.ssh and env secrets
+                         prove the sandbox holds (files, env, syscalls, git, network)
+  agentbox adduser NAME [PROJECT...]
+                         (sudo) create a dedicated agent account with access to PROJECTs
+Options:
+  --ro PATH | --rw PATH  extra grant (home, secrets and personal folders are refused)
+  --mask PATH            hide a file/dir inside a grant, e.g. --mask app/.env (bwrap)
+  --allow-personal       allow granting a subfolder of Documents, Downloads, ...
+  --net MODE             auto (default) | web | proxy | open, see README
+  --port N[-M]           extra TCP ports for --net web
+  --allow-host HOST      extra host for --net proxy (also: ~/.local/share/agentbox/allowlist)
 Env: AGENTBOX_BACKEND=auto|bwrap|landlock  AGENTBOX_PROFILE=name (shared agent home)
 EOF
   exit 2
@@ -33,25 +46,79 @@ REAL_HOME=$HOME
 STATE=$HOME/.local/share/agentbox   # not XDG_DATA_HOME: snaps repoint it per revision
 VSCODE=$STATE/vscode                # one VS Code for all sandboxes
 EXTS=$STATE/extensions              # one extension set for all sandboxes
+# Absolute paths only: the sandbox's PATH starts with the agent-writable
+# ~/.local/bin, and anything resolved through it would run unsandboxed.
+PY=/usr/bin/python3
+[[ -x $PY ]] || die "$PY not found (needed for seccomp and landlock)"
+BWRAP=$(command -v bwrap 2>/dev/null) || BWRAP=''
 
-RO=() RW=()
-parse_grants() {  # sets RO, RW, PROJECT, CMD
+inside() { [[ $1 == "$2" || $1 == "$2"/* ]]; }   # is $1 equal to or below $2?
+
+# Never grantable, nor anything inside them or containing them: agentbox state,
+# credentials, and files the host executes (shell rc, ~/.local/bin).
+# Personal folders (XDG user dirs) are never granted whole; a subfolder needs
+# --allow-personal.
+protected_paths() {
+  local d key val f=${XDG_CONFIG_HOME:-$REAL_HOME/.config}/user-dirs.dirs
+  SECRET=("$STATE")
+  for d in .ssh .gnupg .aws .azure .kube .docker .password-store .pki .mozilla .thunderbird \
+           .config .local/share/keyrings .local/bin bin .netrc .git-credentials .gitconfig \
+           .bashrc .bash_profile .bash_login .profile .zshrc .zprofile .bash_history .zsh_history; do
+    SECRET+=("$(realpath -m -- "$REAL_HOME/$d")")
+  done
+  PERSONAL=()
+  for d in Desktop Documents Downloads Music Pictures Videos Public Templates; do
+    PERSONAL+=("$(realpath -m -- "$REAL_HOME/$d")")
+  done
+  if [[ -r $f ]]; then
+    while IFS='=' read -r key val; do
+      [[ $key == XDG_*_DIR ]] || continue
+      val=${val//\"/}; val=${val/#\$HOME/$REAL_HOME}; val=$(realpath -m -- "$val")
+      if [[ $val == /* && $val != "$REAL_HOME" && " ${PERSONAL[*]} " != *" $val "* ]]; then PERSONAL+=("$val"); fi
+    done <"$f"
+  fi
+}
+
+check_grant() {
+  local p=$1 s
+  [[ $p != / ]] || die "refusing to grant /"
+  if inside "$REAL_HOME" "$p"; then die "refusing to grant $p (contains your home)"; fi
+  for s in "${SECRET[@]}"; do
+    if inside "$p" "$s" || inside "$s" "$p"; then die "refusing to grant $p (protected: $s)"; fi
+  done
+  for s in "${PERSONAL[@]}"; do
+    if inside "$s" "$p"; then die "refusing to grant $p (personal folder $s)"; fi
+    if inside "$p" "$s" && ((!ALLOW_PERSONAL)); then
+      die "refusing to grant $p (inside personal folder $s; add --allow-personal to grant a subfolder)"
+    fi
+  done
+}
+
+RO=() RW=() MASK=() HOSTS=() EXTRA_PORTS=() NET=auto ALLOW_PERSONAL=0 SECCOMP=strict
+parse_grants() {  # sets RO, RW, MASK, NET, PROJECT, CMD, ...
   PROJECT='' CMD=()
+  local p m
   while (($#)); do
     case $1 in
-      --ro) RO+=("$(realpath -e -- "$2")") || die "no such path: $2"; shift 2 ;;
-      --rw) RW+=("$(realpath -e -- "$2")") || die "no such path: $2"; shift 2 ;;
+      --ro) RO+=("$(realpath -e -- "${2:-}")") || die "no such path: ${2:-}"; shift 2 ;;
+      --rw) RW+=("$(realpath -e -- "${2:-}")") || die "no such path: ${2:-}"; shift 2 ;;
+      --mask) MASK+=("$(realpath -e -- "${2:-}")") || die "no such path: ${2:-}"; shift 2 ;;
+      --net) NET=${2:-}; shift 2 ;;
+      --port) [[ ${2:-} =~ ^[0-9]+(-[0-9]+)?$ ]] || die "bad port: ${2:-}"; EXTRA_PORTS+=("$2"); shift 2 ;;
+      --allow-host) [[ ${2:-} =~ ^[A-Za-z0-9*.:-]+$ ]] || die "bad host: ${2:-}"; HOSTS+=("$2"); shift 2 ;;
+      --allow-personal) ALLOW_PERSONAL=1; shift ;;
       --) shift; CMD=("$@"); break ;;
       -*) usage ;;
       *) [[ -z $PROJECT ]] || usage; PROJECT=$(realpath -e -- "$1") || die "no such dir: $1"; shift ;;
     esac
   done
   [[ -n $PROJECT && -d $PROJECT ]] || usage
-  # Granting $HOME (or /) would grant everything we try to hide.
-  local p
-  for p in "$PROJECT" "${RW[@]}" "${RO[@]}"; do
-    [[ $p != / && $p != "$REAL_HOME" && $p != "$STATE"* ]] || die "refusing to grant $p"
-    [[ $REAL_HOME != "$p"/* ]] || die "refusing to grant $p (contains your home)"
+  protected_paths
+  for p in "$PROJECT" "${RW[@]}" "${RO[@]}"; do check_grant "$p"; done
+  for m in "${MASK[@]}"; do
+    local ok=0
+    for p in "$PROJECT" "${RW[@]}" "${RO[@]}"; do if inside "$m" "$p" && [[ $m != "$p" ]]; then ok=1; fi; done
+    ((ok)) || die "--mask $m is not inside a granted path"
   done
 }
 
@@ -75,15 +142,14 @@ base_env() {
   [[ -z ${TZ:-} ]] || ENV+=(TZ="$TZ")
 }
 
-have_bwrap() { command -v bwrap >/dev/null && bwrap --ro-bind / / --unshare-user --unshare-pid true 2>/dev/null; }
-have_landlock() {
-  command -v python3 >/dev/null &&
-    python3 -I -c 'import ctypes,sys;sys.exit(ctypes.CDLL(None).syscall(444,None,0,1)<1)' 2>/dev/null
-}
+LL_ABI=$("$PY" -I -c 'import ctypes;print(ctypes.CDLL(None).syscall(444,None,0,1))' 2>/dev/null) || LL_ABI=0
+((LL_ABI > 0)) || LL_ABI=0
+have_bwrap() { [[ -n $BWRAP ]] && "$BWRAP" --ro-bind / / --unshare-user --unshare-pid true 2>/dev/null; }
+have_landlock() { ((LL_ABI >= 1)); }
 pick_backend() {
   case ${AGENTBOX_BACKEND:-auto} in
     bwrap) have_bwrap || die 'bwrap unusable (missing or user namespaces blocked)'; BACKEND=bwrap ;;
-    landlock) have_landlock || die 'landlock unavailable (needs python3 + kernel >= 5.13)'; BACKEND=landlock ;;
+    landlock) have_landlock || die 'landlock unavailable (needs kernel >= 5.13)'; BACKEND=landlock ;;
     auto) if have_bwrap; then BACKEND=bwrap
           elif have_landlock; then BACKEND=landlock
             echo 'agentbox: WARNING: bwrap unusable, using weaker landlock backend' >&2
@@ -92,66 +158,348 @@ pick_backend() {
   esac
 }
 
+# Network modes: open = anything the host reaches; web = TCP connect only to
+# 443/80/53/22, the ephemeral range (IDE, debugger and forwarded ports) and
+# --port grants, which keeps local databases, Docker and dev servers out;
+# proxy = no network but an allowlisting HTTPS proxy outside the sandbox.
+resolve_net() {
+  case $NET in
+    auto) if ((LL_ABI >= 4)); then NET=web; else NET=open
+            echo 'agentbox: WARNING: kernel < 6.7 cannot restrict ports; network is open' >&2; fi ;;
+    web) ((LL_ABI >= 4)) || die '--net web needs Landlock ABI 4 (kernel >= 6.7)' ;;
+    proxy) [[ $BACKEND == bwrap ]] || die '--net proxy needs the bwrap backend' ;;
+    open) ;;
+    *) die "unknown --net mode: $NET (auto|web|proxy|open)" ;;
+  esac
+}
+web_ports() {
+  local lo hi p out=443,80,53,22
+  read -r lo hi </proc/sys/net/ipv4/ip_local_port_range
+  out+=",$lo-$hi"
+  for p in "${EXTRA_PORTS[@]}"; do out+=",$p"; done
+  echo "$out"
+}
+
+DEFAULT_ALLOW='# Hosts reachable with --net proxy (HTTPS CONNECT, port 443 unless "host:port").
+# "example.com" = exactly that host, "*.example.com" = any subdomain.
+# Edit outside the sandbox; changes apply to new connections immediately.
+api.anthropic.com
+*.anthropic.com
+claude.ai
+*.claude.ai
+api.openai.com
+*.openai.com
+chatgpt.com
+*.chatgpt.com
+github.com
+api.github.com
+codeload.github.com
+*.githubusercontent.com
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+marketplace.visualstudio.com
+*.gallery.vsassets.io
+*.gallerycdn.vsassets.io'
+
+# Starts the allowlisting proxy on a Unix socket outside the sandbox. It exits
+# when this process (which becomes bwrap) does.
+start_proxy() {
+  local run i allow=$STATE/allowlist
+  [[ -e $allow ]] || printf '%s\n' "$DEFAULT_ALLOW" >"$allow"
+  run=$(mktemp -d "${AHOME%/home}/run.XXXXXX")
+  PROXY_SOCK=$run/proxy.sock
+  "$PY" -I -c "$PUMP_PY$PROXY_PY" "$PROXY_SOCK" "$allow" "${AHOME%/home}/proxy.log" $$ "${HOSTS[@]}" \
+    </dev/null >/dev/null 2>&1 &
+  for ((i = 0; i < 100; i++)); do [[ -S $PROXY_SOCK ]] && return; sleep 0.02; done
+  die 'proxy did not start'
+}
+
+# Git runs code named in .git/config and .git/hooks with your full rights when
+# you use the repo outside the sandbox. Make those read-only, and bind .git onto
+# itself: a mount point cannot be renamed away and replaced by a fake .git.
+git_protect() {  # appends to the caller's bwrap array `a`
+  local root g sub f
+  for root in "$@"; do
+    while IFS= read -r -d '' g; do
+      [[ -d $g ]] || continue
+      mkdir -p "$g/hooks" "$g/info"
+      a+=(--bind "$g" "$g")
+      for f in config config.worktree hooks info; do [[ ! -e $g/$f ]] || a+=(--ro-bind "$g/$f" "$g/$f"); done
+      # submodule repos keep their own config and hooks under .git/modules/
+      while IFS= read -r -d '' sub; do
+        sub=${sub%/config}; mkdir -p "$sub/hooks"
+        a+=(--bind "$sub" "$sub" --ro-bind "$sub/config" "$sub/config" --ro-bind "$sub/hooks" "$sub/hooks")
+      done < <(find "$g/modules" -name config -type f -print0 2>/dev/null)
+    done < <(find "$root" -maxdepth 3 \( -name node_modules -o -name .venv \) -prune -o -name .git -print0 -prune 2>/dev/null)
+  done
+}
+has_git_repo() {
+  local root
+  for root in "$@"; do
+    [[ -z $(find "$root" -maxdepth 3 \( -name node_modules -o -name .venv \) -prune -o -name .git -print -quit 2>/dev/null) ]] || return 0
+  done
+  return 1
+}
+
 # exec_sandboxed EXTRA_BWRAP_ARGS_ARRAY_NAME CMD...
 exec_sandboxed() {
   local -n extra=$1; shift
-  local p
+  local p stub=(--seccomp "$SECCOMP")
+  ENV+=(AGENTBOX_NET="$NET")
+  case $NET in
+    web) stub+=(--ports "$(web_ports)") ;;
+    proxy) start_proxy
+           stub+=(--forward /run/agentbox/proxy.sock)
+           ENV+=(HTTPS_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128
+                 HTTP_PROXY=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128
+                 NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1) ;;
+  esac
   if [[ $BACKEND == bwrap ]]; then
-    local a=(--die-with-parent --unshare-all --share-net --hostname agentbox
+    # TIOCSTI keystroke injection is blocked by the seccomp filter, so the
+    # sandbox keeps the caller's terminal (job control, Ctrl-C).
+    local a=(--die-with-parent --unshare-all --hostname agentbox
              --ro-bind /usr /usr --ro-bind /etc /etc --proc /proc --dev /dev
              --ro-bind-try /run/systemd/resolve /run/systemd/resolve
              --tmpfs /tmp --tmpfs "$REAL_HOME" --bind "$AHOME" "$REAL_HOME")
+    if [[ $NET == proxy ]]; then a+=(--ro-bind "$PROXY_SOCK" /run/agentbox/proxy.sock); else a+=(--share-net); fi
     for p in /bin /sbin /lib /lib32 /lib64 /libx32; do
       if [[ -L $p ]]; then a+=(--symlink "$(readlink "$p")" "$p")
       elif [[ -d $p ]]; then a+=(--ro-bind "$p" "$p"); fi
     done
-    # TIOCSTI keystroke injection into the caller's terminal is only possible
-    # where the kernel still allows it; detach from the tty in that case.
-    [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null) == 0 ]] || a+=(--new-session)
     for p in "${RO[@]}"; do a+=(--ro-bind "$p" "$p"); done
     for p in "${RW[@]}" "$PROJECT"; do a+=(--bind "$p" "$p"); done
-    exec "${ENV[@]}" bwrap "${a[@]}" "${extra[@]}" --chdir "$PROJECT" -- "$@"
+    git_protect "${RW[@]}" "$PROJECT"
+    # binds are nodev, so a masked file becomes an empty regular file, not /dev/null
+    [[ -e $STATE/empty ]] || : >"$STATE/empty"
+    for p in "${MASK[@]}"; do
+      if [[ -d $p ]]; then a+=(--tmpfs "$p" --remount-ro "$p"); else a+=(--ro-bind "$STATE/empty" "$p"); fi
+    done
+    exec "${ENV[@]}" "$BWRAP" "${a[@]}" "${extra[@]}" --chdir "$PROJECT" -- \
+      "$PY" -I -c "$NR_PY$STUB_PY" "${stub[@]}" -- "$@"
   else
     # Landlock: paths stay visible but every access outside the grants is denied.
+    ((${#MASK[@]} == 0)) || die '--mask needs the bwrap backend'
+    if has_git_repo "${RW[@]}" "$PROJECT"; then
+      echo 'agentbox: WARNING: landlock cannot make .git/config and .git/hooks read-only;' \
+           'outside the sandbox use "agentbox git" instead of git for this repo' >&2
+    fi
     local a=(--ro /usr --ro /etc --ro /proc --ro /sys --dev /dev)
     for p in /bin /sbin /lib /lib32 /lib64 /libx32 /run/systemd/resolve; do [[ -e $p ]] && a+=(--ro "$p"); done
     for p in "${RO[@]}"; do a+=(--ro "$p"); done
     for p in "${RW[@]}" "$PROJECT"; do a+=(--rw "$p"); done
     cd "$PROJECT"
     exec "${ENV[@]}" HOME="$AHOME" TMPDIR="$AHOME/tmp" PATH="$AHOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-      python3 -I -c "$LANDLOCK_PY" "${a[@]}" --rw "$AHOME" -- "$@"
+      "$PY" -I -c "$NR_PY$STUB_PY" "${a[@]}" --rw "$AHOME" "${stub[@]}" -- "$@"
   fi
 }
 
-LANDLOCK_PY='
-import ctypes, os, struct, sys
+# Syscall numbers for the seccomp filter and the checks (x86_64, aarch64).
+NR_PY='
+import os
+NR = {
+  "x86_64": dict(ptrace=101, process_vm_readv=310, process_vm_writev=311, keyctl=250, add_key=248,
+    request_key=249, bpf=321, userfaultfd=323, perf_event_open=298, kexec_load=246,
+    kexec_file_load=320, mount=165, umount2=166, pivot_root=155, chroot=161, init_module=175,
+    finit_module=313, delete_module=176, open_by_handle_at=304, setns=308, swapon=167,
+    swapoff=168, reboot=169, acct=163, syslog=103, quotactl=179, lookup_dcookie=212,
+    iopl=172, ioperm=173, uselib=134, unshare=272, clone=56, ioctl=16),
+  "aarch64": dict(ptrace=117, process_vm_readv=270, process_vm_writev=271, keyctl=219, add_key=217,
+    request_key=218, bpf=280, userfaultfd=282, perf_event_open=241, kexec_load=104,
+    kexec_file_load=294, mount=40, umount2=39, pivot_root=41, chroot=51, init_module=105,
+    finit_module=273, delete_module=106, open_by_handle_at=265, setns=268, swapon=224,
+    swapoff=225, reboot=142, acct=89, syslog=116, quotactl=60, lookup_dcookie=18,
+    unshare=97, clone=220, ioctl=29),
+}.get(os.uname().machine)
+if NR is not None:
+  NR.update(io_uring_setup=425, io_uring_enter=426, io_uring_register=427, open_tree=428,
+            move_mount=429, fsopen=430, fsconfig=431, fsmount=432, fspick=433, clone3=435,
+            mount_setattr=442)
+'
+
+PUMP_PY='
+import socket, threading
+def pump(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d: break
+            b.sendall(d)
+    except OSError: pass
+    try: b.shutdown(socket.SHUT_WR)
+    except OSError: pass
+def splice(a, b, first=b""):
+    try:
+        if first: b.sendall(first)
+        t = threading.Thread(target=pump, args=(b, a), daemon=True); t.start()
+        pump(a, b); t.join()
+    finally:
+        a.close(); b.close()
+'
+
+# Runs inside the sandbox right before the agent: Landlock (files for the
+# landlock backend, TCP ports for --net web), seccomp, the proxy forwarder.
+STUB_PY=$PUMP_PY'
+import ctypes, struct, sys
+def fail(msg): sys.exit("agentbox: FAIL CLOSED: " + msg)
 libc = ctypes.CDLL(None, use_errno=True)
 sc = libc.syscall; sc.restype = ctypes.c_long
+args = sys.argv[1:]; i = args.index("--"); opts, cmd = args[:i], args[i + 1:]
+fs, ports, mode, fwd = [], [], "strict", None
+for k, v in zip(opts[::2], opts[1::2]):
+    if k in ("--ro", "--rw", "--dev"): fs.append((k, v))
+    elif k == "--seccomp": mode = v
+    elif k == "--forward": fwd = v
+    elif k == "--ports":
+        for r in v.split(","):
+            lo, _, hi = r.partition("-")
+            ports += range(int(lo), int(hi or lo) + 1)
+    else: fail("bad stub option " + k)
+
 abi = sc(444, None, 0, 1)
-if abi < 1: sys.exit("agentbox: FAIL CLOSED: landlock unavailable")
-FILE_BITS = 1 | 2 | 4 | (1 << 14 if abi >= 3 else 0)         # exec, write, read, truncate
-RO = 1 | 4 | 8                                               # exec, read file, read dir
-ALL = (1 << 13) - 1 | (1 << 13 if abi >= 2 else 0) | (1 << 14 if abi >= 3 else 0) | (1 << 15 if abi >= 5 else 0)
-DEV = RO | 2 | (1 << 15 if abi >= 5 else 0)                  # /dev/null, /dev/tty
-scoped = 3 if abi >= 6 else 0                                # abstract unix sockets + signals
-attr = struct.pack("QQQ", ALL, 0, scoped) if abi >= 6 else struct.pack("Q", ALL)
-fd = sc(444, attr, len(attr), 0)
-if fd < 0: sys.exit("agentbox: FAIL CLOSED: landlock_create_ruleset failed")
-args = sys.argv[1:]; i = args.index("--"); rules, cmd = args[:i], args[i + 1:]
-for kind, path in zip(rules[::2], rules[1::2]):
-    acc = {"--ro": RO, "--rw": ALL, "--dev": DEV}[kind]
-    pfd = os.open(path, os.O_PATH | os.O_CLOEXEC)
-    if not os.path.isdir(path): acc &= FILE_BITS
-    if sc(445, fd, 1, struct.pack("=Qi", acc, pfd), 0) != 0:
-        sys.exit("agentbox: FAIL CLOSED: landlock_add_rule " + path)
-    os.close(pfd)
-if libc.prctl(38, 1, 0, 0, 0) != 0 or sc(446, fd, 0) != 0:
-    sys.exit("agentbox: FAIL CLOSED: landlock_restrict_self failed")
+hfs = hnet = scoped = 0
+if fs:
+    if abi < 1: fail("landlock unavailable")
+    hfs = (1 << 13) - 1 | (1 << 13 if abi >= 2 else 0) | (1 << 14 if abi >= 3 else 0) | (1 << 15 if abi >= 5 else 0)
+if ports:
+    if abi < 4: fail("landlock port rules need kernel >= 6.7")
+    hnet = 2                                                 # connect_tcp
+if abi >= 6: scoped = 3                                      # abstract unix sockets + signals
+if hfs or hnet or scoped:
+    attr = struct.pack("QQQ", hfs, hnet, scoped) if abi >= 6 else struct.pack("QQ", hfs, hnet) if abi >= 4 else struct.pack("Q", hfs)
+    fd = sc(444, attr, len(attr), 0)
+    if fd < 0: fail("landlock_create_ruleset failed")
+    FILE_BITS = 1 | 2 | 4 | (1 << 14 if abi >= 3 else 0)   # exec, write, read, truncate
+    RO = 1 | 4 | 8                                          # exec, read file, read dir
+    DEV = RO | 2 | (1 << 15 if abi >= 5 else 0)             # /dev/null, /dev/tty
+    for kind, path in fs:
+        acc = {"--ro": RO, "--rw": hfs, "--dev": DEV}[kind]
+        pfd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+        if not os.path.isdir(path): acc &= FILE_BITS
+        if sc(445, fd, 1, struct.pack("=Qi", acc, pfd), 0) != 0: fail("landlock_add_rule " + path)
+        os.close(pfd)
+    for p in sorted(set(ports)):
+        if sc(445, fd, 2, struct.pack("=QQ", 2, p), 0) != 0: fail("landlock port rule %d" % p)
+if libc.prctl(38, 1, 0, 0, 0) != 0: fail("no_new_privs")
+if (hfs or hnet or scoped) and sc(446, fd, 0) != 0: fail("landlock_restrict_self failed")
+
+# seccomp: deny kernel attack surface and same-UID escape hatches (keyring,
+# ptrace, namespaces, TIOCSTI). "gui" keeps namespaces for Chromium sandboxes.
+if NR is None: fail("seccomp: unsupported architecture " + os.uname().machine)
+LD, JEQ, JGE, JSET, RET = 0x20, 0x15, 0x35, 0x45, 0x06
+ALLOW, KILL, EPERM, ENOSYS = 0x7FFF0000, 0x80000000, 0x50001, 0x50026
+x86 = os.uname().machine == "x86_64"
+prog = []
+def op(code, k, jt=0, jf=0): prog.append(struct.pack("HBBI", code, jt, jf, k))
+op(LD, 4); op(JEQ, 0xC000003E if x86 else 0xC00000B7, 1, 0); op(RET, KILL)
+op(LD, 0)
+if x86: op(JGE, 0x40000000, 0, 1); op(RET, EPERM)           # x32 ABI
+BLOCK = ["ptrace", "process_vm_readv", "process_vm_writev", "keyctl", "add_key", "request_key",
+         "bpf", "userfaultfd", "perf_event_open", "kexec_load", "kexec_file_load", "mount", "umount2",
+         "pivot_root", "chroot", "init_module", "finit_module", "delete_module", "open_by_handle_at",
+         "swapon", "swapoff", "reboot", "acct", "syslog", "quotactl", "lookup_dcookie", "iopl", "ioperm",
+         "uselib", "io_uring_setup", "io_uring_enter", "io_uring_register", "open_tree", "move_mount",
+         "fsopen", "fsconfig", "fsmount", "fspick", "mount_setattr"]
+if mode != "gui": BLOCK.append("setns")
+for name in BLOCK:
+    if name in NR: op(JEQ, NR[name], 0, 1); op(RET, EPERM)
+op(JEQ, NR["clone3"], 0, 1); op(RET, ENOSYS)                  # flags hidden in a struct; libc falls back to clone
+if mode != "gui":
+    for name in ("clone", "unshare"):                         # no new namespaces of any kind
+        op(JEQ, NR[name], 0, 4); op(LD, 16); op(JSET, 0x7E020000, 0, 1); op(RET, EPERM); op(RET, ALLOW)
+op(JEQ, NR["ioctl"], 0, 5); op(LD, 24)                         # TIOCSTI, TIOCLINUX
+op(JEQ, 0x5412, 1, 0); op(JEQ, 0x541C, 0, 1); op(RET, EPERM); op(RET, ALLOW)
+op(RET, ALLOW)
+class FProg(ctypes.Structure): _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+buf = ctypes.create_string_buffer(b"".join(prog))
+if libc.prctl(22, 2, ctypes.byref(FProg(len(prog), ctypes.addressof(buf))), 0, 0) != 0: fail("seccomp")
+
+# --net proxy: 127.0.0.1:3128 inside the sandbox -> the host proxy socket.
+if fwd:
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("127.0.0.1", 3128)); ls.listen(64)
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()
+        if os.fork(): os._exit(0)
+        null = os.open("/dev/null", os.O_RDWR)
+        for f in (0, 1, 2): os.dup2(null, f)
+        def serve(c):
+            u = socket.socket(socket.AF_UNIX)
+            try: u.connect(fwd)
+            except OSError: c.close(); return
+            splice(c, u)
+        while True:
+            c, _ = ls.accept()
+            threading.Thread(target=serve, args=(c,), daemon=True).start()
+    os.waitpid(pid, 0); ls.close()
 os.execvp(cmd[0], cmd)
 '
 
+# Host side of --net proxy: HTTPS CONNECT to allowlisted hosts only, logged.
+PROXY_PY='
+import os, sys, time
+sock_path, allow_file, log_path, watch = sys.argv[1:5]
+extra = sys.argv[5:]
+lock = threading.Lock()
+def log(verdict, target):
+    with lock, open(log_path, "a") as f:
+        f.write("%s %s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), verdict, target))
+def allowed(host, port):
+    pats = list(extra)
+    try:
+        with open(allow_file) as f: pats += [l.split("#")[0].strip() for l in f]
+    except OSError: pass
+    host = host.lower().rstrip(".")
+    for p in filter(None, pats):
+        hp, _, pp = p.lower().partition(":")
+        if port != (int(pp) if pp.isdigit() else 443): continue
+        if hp == host or (hp.startswith("*.") and host.endswith(hp[1:])): return True
+    return False
+def handle(c):
+    try:
+        c.settimeout(30); buf = b""
+        while b"\r\n\r\n" not in buf:
+            d = c.recv(4096)
+            if not d or len(buf) > 16384: c.close(); return
+            buf += d
+        head, rest = buf.split(b"\r\n\r\n", 1)
+        parts = head.split(b"\r\n")[0].decode("latin-1").split()
+        if len(parts) != 3 or parts[0] != "CONNECT":
+            log("DENY", "non-CONNECT " + " ".join(parts[:2]))
+            c.sendall(b"HTTP/1.1 405 Only HTTPS CONNECT allowed\r\nContent-Length: 0\r\n\r\n"); c.close(); return
+        host, _, port = parts[1].rpartition(":")
+        host = host.strip("[]"); port = int(port)
+        if not allowed(host, port):
+            log("DENY", parts[1])
+            c.sendall(b"HTTP/1.1 403 Host not in agentbox allowlist\r\nContent-Length: 0\r\n\r\n"); c.close(); return
+        u = socket.create_connection((host, port), timeout=15)
+        log("ALLOW", parts[1])
+        c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        c.settimeout(None); u.settimeout(None)
+        splice(c, u, rest)
+    except (OSError, ValueError):
+        try: c.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        except OSError: pass
+        c.close()
+def watchdog():
+    while True:
+        time.sleep(1)
+        try: os.kill(int(watch), 0)
+        except ProcessLookupError:
+            try: os.unlink(sock_path); os.rmdir(os.path.dirname(sock_path))
+            except OSError: pass
+            os._exit(0)
+        except PermissionError: pass
+s = socket.socket(socket.AF_UNIX); s.bind(sock_path); s.listen(64)
+threading.Thread(target=watchdog, daemon=True).start()
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+'
+
 cmd_run() {
-  parse_grants "$@"; agent_home; base_env; pick_backend
+  parse_grants "$@"; agent_home; base_env; pick_backend; resolve_net
   ((${#CMD[@]})) || CMD=(/bin/bash -l)
   local none=()
   exec_sandboxed none "${CMD[@]}"
@@ -188,15 +536,16 @@ cmd_setup() {
 cmd_ext() {
   (($#)) || usage
   PROJECT=$STATE/ext-admin; mkdir -p "$PROJECT"
-  AGENTBOX_PROFILE=ext-admin; agent_home; base_env; pick_backend
+  AGENTBOX_PROFILE=ext-admin; agent_home; base_env; pick_backend; resolve_net
   [[ $BACKEND == bwrap ]] || die 'ext requires the bwrap backend'
   vscode_mounts rw
   exec_sandboxed X "$BIN" --extensions-dir "$EXT_IN" "$@"
 }
 
 cmd_code() {
-  parse_grants "$@"; agent_home; base_env; pick_backend
+  parse_grants "$@"; agent_home; base_env; pick_backend; resolve_net
   [[ $BACKEND == bwrap ]] || die 'VS Code mode requires the bwrap backend'
+  SECCOMP=gui   # Chromium's own sandbox needs namespaces
   vscode_mounts ro
   local cfg=$AHOME/.config/Code/User/settings.json
   [[ -e $cfg ]] || { mkdir -p "${cfg%/*}"; printf '%s\n' '{' '  "update.mode": "none",' \
@@ -224,7 +573,7 @@ cmd_code() {
 # Every session with that key (shell, VS Code Server, agents) runs sandboxed.
 cmd_gate() {
   local project=${1:-}; shift || true
-  parse_grants "$project" "$@"; agent_home; base_env; pick_backend
+  parse_grants "$project" "$@"; agent_home; base_env; pick_backend; resolve_net
   local none=()
   if [[ -n ${SSH_ORIGINAL_COMMAND:-} ]]; then
     exec_sandboxed none /bin/bash -c "$SSH_ORIGINAL_COMMAND"
@@ -233,25 +582,143 @@ cmd_gate() {
   fi
 }
 
-cmd_check() {
-  local dir=${1:-$(mktemp -d)}; export AGENTBOX_PROFILE=${AGENTBOX_PROFILE:-agentbox-check}
-  local canary="$REAL_HOME/.agentbox-canary-$$"
-  echo secret >"$canary"; trap "rm -f '$canary'" EXIT
-  export AGENTBOX_TEST_SECRET=leak
-  # shellcheck disable=SC2016
-  if (cmd_run "$dir" -- /bin/bash -c '
-      fail=0; t() { if eval "$2" >/dev/null 2>&1; then echo "FAIL  $1"; fail=1; else echo "ok    $1"; fi; }
-      t "home canary unreadable"        "cat '"$canary"'"
-      t "~/.ssh hidden"                 "ls '"$REAL_HOME"'/.ssh"
-      t "env secret not inherited"      "test -n \"\${AGENTBOX_TEST_SECRET:-}\""
-      t "ssh-agent socket not inherited" "test -n \"\${SSH_AUTH_SOCK:-}\""
-      t "/root unreadable"              "ls /root"
-      t "project writable"             "! touch .agentbox-w"
-      rm -f .agentbox-w; exit $fail'); then
-    echo "PASS: sandbox enforced (backend: $(AGENTBOX_BACKEND=${AGENTBOX_BACKEND:-auto}; pick_backend 2>/dev/null; echo "$BACKEND"))"
-  else
-    die 'sandbox checks failed; do not use'
+# Host-side git for a repo an agent could write to. Repo config that makes git
+# run a command is refused (reading config never runs anything), and hooks
+# never run. The landlock backend cannot make .git read-only, so use this there.
+cmd_git() {
+  command -v git >/dev/null || die 'git not found'
+  local pre=() cfg bad
+  while [[ ${1:-} == -C ]]; do pre+=(-C "$2"); shift 2; done
+  cfg=$(git "${pre[@]}" config --local --no-includes --name-only --list 2>/dev/null) || cfg=''
+  bad=$(grep -Ei '^(include|includeif|url|alias|credential)\.|^core\.(fsmonitor|sshcommand|pager|editor|askpass|hookspath|gitproxy|worktree|alternaterefscommand)$|^(sequence\.editor|gpg(\..*)?\.program|extensions\.worktreeconfig)$|^(uploadpack|receivepack|remote\..*\.(uploadpack|receivepack|proxy)|http\..*proxy)|^(filter|diff|merge)\..*\.(clean|smudge|process|command|textconv|driver)$' <<<"$cfg") || true
+  if [[ -n $bad ]]; then
+    printf 'agentbox: repo config can run commands or redirect git; inspect .git/config:\n' >&2
+    printf '  %s\n' $bad >&2
+    exit 1
   fi
+  exec git "${pre[@]}" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
+
+# Dedicated account: a separate UID also blocks signals, ptrace, abstract
+# sockets, /tmp files and the kernel keyring of your own processes.
+cmd_adduser() {
+  local user=${1:-} self h p d me; shift || true
+  [[ $user =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || usage
+  command -v setfacl >/dev/null || die 'setfacl not found (sudo apt install acl)'
+  self=$(realpath -e "$0"); me=$(id -un)
+  id "$user" >/dev/null 2>&1 || sudo useradd -m -s /bin/bash "$user"
+  h=$(getent passwd "$user" | cut -d: -f6)
+  sudo -u "$user" mkdir -p "$h/.local/bin"
+  sudo install -m 755 -o "$user" "$self" "$h/.local/bin/agentbox"
+  for p in "$@"; do
+    p=$(realpath -e -- "$p") || die "no such dir: $p"
+    # both users keep full access to everything either of them creates
+    sudo setfacl -R -m "u:$user:rwX,u:$me:rwX" "$p"
+    sudo find "$p" -type d -exec setfacl -m "d:u:$user:rwX,d:u:$me:rwX" {} +
+    d=${p%/*}
+    while [[ -n $d ]]; do sudo setfacl -m "u:$user:--x" "$d"; d=${d%/*}; done   # traverse only
+    echo "granted $user: $p"
+  done
+  sudo -u "$user" -i "$h/.local/bin/agentbox" check
+  echo "Run agents as: sudo -u $user -i agentbox PROJECT -- claude   (or put the gate line in $h/.ssh/authorized_keys)"
+}
+
+# Probes run inside the sandbox. "limit" lines are documented gaps of the
+# current backend or network mode, not failures.
+CHECK_PY='
+import ctypes, errno, socket, subprocess, sys, random
+canary, home, host_pid, fx, abstract, backend, net = sys.argv[1:8]; personal = sys.argv[8:]
+libc = ctypes.CDLL(None, use_errno=True); sc = libc.syscall; sc.restype = ctypes.c_long
+fail = 0
+def t(name, blocked, limit=None):
+    global fail
+    if blocked: print("ok    " + name)
+    elif limit: print("limit " + name + ": " + limit)
+    else: print("FAIL  " + name); fail = 1
+def denied(fn):
+    try: fn(); return False
+    except OSError: return True
+def eperm(r): return r == -1 and ctypes.get_errno() == errno.EPERM
+
+t("home canary unreadable", denied(lambda: open(canary).read()))
+t("~/.ssh hidden", denied(lambda: os.listdir(home + "/.ssh")))
+for d in personal: t(d.replace(home, "~") + " hidden", denied(lambda: os.listdir(d)))
+t("/root unreadable", denied(lambda: os.listdir("/root")))
+t("env secret not inherited", "AGENTBOX_TEST_SECRET" not in os.environ)
+t("ssh-agent socket not inherited", "SSH_AUTH_SOCK" not in os.environ)
+t("host process environ unreadable", denied(lambda: open("/proc/%s/environ" % host_pid, "rb").read()))
+
+t("kernel keyring blocked", eperm(sc(NR["keyctl"], 0, -4, 0)))
+t("ptrace blocked", eperm(sc(NR["ptrace"], 12, 0x3FFFFFFF, 0, 0)))
+t("io_uring blocked", eperm(sc(NR["io_uring_setup"], 1, 0)))
+t("new user namespace blocked", libc.unshare(0x10000000) != 0)
+nul = os.open("/dev/null", os.O_RDWR)
+t("TIOCSTI keystroke injection blocked", eperm(libc.ioctl(nul, 0x5412, ctypes.c_char_p(b"x"))))
+
+lim = "landlock cannot protect .git; use agentbox git on the host" if backend == "landlock" else None
+if os.path.isdir(fx + "/.git"):
+    r = subprocess.run(["git", "-C", fx, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q",
+                        "--allow-empty", "-m", "check"], capture_output=True)
+    t("agent can still commit", r.returncode == 0)
+    t(".git/config read-only", denied(lambda: open(fx + "/.git/config", "a").close()), lim)
+    t(".git/hooks read-only", denied(lambda: open(fx + "/.git/hooks/pre-push", "w").close()), lim)
+    t(".git cannot be swapped for a fake", denied(lambda: os.rename(fx + "/.git", fx + "/.git-moved")), lim)
+if backend == "bwrap":
+    t("--mask hides .env", "leak" not in open(fx + "/.env").read())
+
+s = socket.socket(socket.AF_UNIX)
+t("host abstract unix socket unreachable", denied(lambda: s.connect("\0" + abstract)),
+  "shared with the host; use --net proxy or a dedicated user" if net != "proxy" else None)
+if net == "web":
+    for _ in range(20):
+        port = random.randint(20000, 29999); l = socket.socket()
+        try: l.bind(("127.0.0.1", port)); l.listen(1); break
+        except OSError: l.close()
+    t("local service port %d unreachable" % port, denied(lambda: socket.create_connection(("127.0.0.1", port), 2)))
+elif net == "open":
+    t("local service ports unreachable", False, "--net open")
+elif net == "proxy":
+    t("direct internet unreachable", denied(lambda: socket.create_connection(("1.1.1.1", 443), 3)))
+    p = socket.create_connection(("127.0.0.1", 3128), 5)
+    p.sendall(b"CONNECT example.invalid:443 HTTP/1.1\r\n\r\n")
+    t("proxy refuses hosts outside allowlist", b" 403 " in p.recv(200))
+try:
+    open(".agentbox-w", "w").close(); os.unlink(".agentbox-w"); t("project writable", True)
+except OSError: t("project writable", False)
+sys.exit(fail)
+'
+
+cmd_check() {
+  local dir=${1:-} fixture canary lpid fail=0 abs=agentbox-check-$$ d mode net modes=(auto)
+  [[ -n $dir ]] || dir=$(mktemp -d)
+  export AGENTBOX_PROFILE=${AGENTBOX_PROFILE:-agentbox-check} AGENTBOX_TEST_SECRET=leak
+  canary="$REAL_HOME/.agentbox-canary-$$"; fixture=$(mktemp -d)
+  echo secret >"$canary"; echo 'API_KEY=leak' >"$fixture/.env"
+  ! command -v git >/dev/null || git -C "$fixture" init -q
+  "$PY" -I -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind("\0"+sys.argv[1]); s.listen(8)
+while True: s.accept()[0].close()' "$abs" & lpid=$!
+  trap "rm -f '$canary'; rm -rf '$fixture'; kill $lpid 2>/dev/null" EXIT
+  pick_backend; protected_paths
+  [[ $BACKEND != bwrap ]] || modes+=(proxy)
+
+  echo "== grants (host side)"
+  refuse() { if (parse_grants "$@" "$dir") >/dev/null 2>&1; then echo "FAIL  grant refused: ${*: -1}"; fail=1
+             else echo "ok    grant refused: ${*: -1}"; fi; }
+  refuse --ro "$REAL_HOME"
+  for d in .ssh .config .local/bin .bashrc; do [[ ! -e $REAL_HOME/$d ]] || refuse --ro "$REAL_HOME/$d"; done
+  for d in "${PERSONAL[@]}"; do [[ ! -d $d ]] || refuse --ro "$d"; done
+
+  local opts=(--rw "$fixture") personal=()
+  [[ $BACKEND != bwrap ]] || opts+=(--mask "$fixture/.env")
+  for d in "${PERSONAL[@]}"; do [[ ! -d $d ]] || personal+=("$d"); done
+  for mode in "${modes[@]}"; do
+    net=$mode; [[ $net != auto ]] || { ((LL_ABI >= 4)) && net=web || net=open; }
+    echo "== sandbox (backend: $BACKEND, --net $net)"
+    (cmd_run --net "$mode" "${opts[@]}" "$dir" -- "$PY" -I -c "$NR_PY$CHECK_PY" \
+       "$canary" "$REAL_HOME" "$$" "$fixture" "$abs" "$BACKEND" "$net" "${personal[@]}") || fail=1
+  done
+  ((fail == 0)) || die 'sandbox checks failed; do not use'
+  echo "PASS: sandbox enforced (backend: $BACKEND)"
 }
 
 case ${1:-} in
@@ -259,7 +726,9 @@ case ${1:-} in
   ext) shift; cmd_ext "$@" ;;
   code) shift; cmd_code "$@" ;;
   gate) shift; cmd_gate "$@" ;;
+  git) shift; cmd_git "$@" ;;
   check) shift; cmd_check "$@" ;;
+  adduser) shift; cmd_adduser "$@" ;;
   ''|-h|--help) usage ;;
   *) cmd_run "$@" ;;
 esac
