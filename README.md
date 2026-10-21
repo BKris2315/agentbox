@@ -311,7 +311,7 @@ Tested on Ubuntu 22.04, kernel 6.8 (Landlock ABI 4), bwrap 0.6.1:
   - aarch64
   - Ubuntu 24.04
 
-## Known limits (be honest about these)
+## Known limits
 
 - **Network, except with `--net proxy`.**
   - `web` restricts ports, not hosts. The agent can send anything it can read to any server on port 443.
